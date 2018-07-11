@@ -35,9 +35,9 @@ import org.jitsi.jibri.sipgateway.SipClientParams
 import org.jitsi.jibri.util.NameableThreadFactory
 import org.jitsi.jibri.util.extensions.error
 import org.jitsi.jibri.util.getCallUrlInfoFromJid
-import org.jitsi.xmpp.TrustAllHostnameVerifier
-import org.jitsi.xmpp.TrustAllX509TrustManager
 import org.jitsi.xmpp.mucclient.MucClient
+import org.jitsi.xmpp.mucclient.MucClientConfiguration
+import org.jitsi.xmpp.mucclient.MucClientManager
 import org.jivesoftware.smack.packet.IQ
 import org.jivesoftware.smack.packet.Presence
 import org.jivesoftware.smack.packet.XMPPError
@@ -61,84 +61,75 @@ typealias MucClientProvider = (XMPPTCPConnectionConfiguration, String) -> MucCli
  * [XmppApi] takes care of translating the XMPP commands into the appropriate
  * [JibriManager] API calls and translates the results into XMPP IQ responses.
  */
-class XmppApi(
+class XmppApi (
     private val jibriManager: JibriManager,
     private val xmppConfigs: List<XmppEnvironmentConfig>
 ) {
     private val logger = Logger.getLogger(this::class.qualifiedName)
     private val executor = Executors.newSingleThreadExecutor(NameableThreadFactory("XmppApi"))
-    private val defaultMucClientProvider = { config: XMPPTCPConnectionConfiguration, context: String ->
-        MucClient(config, context)
-    }
 
     /**
      * Start up the XMPP API by connecting and logging in to all the configured XMPP environments.  For each XMPP
      * connection, we'll listen for incoming [JibriIq] messages and handle them appropriately.  Join the MUC on
      * each connection and send an initial [JibriStatusPacketExt] presence.
      */
-    fun start(mucClientProvider: MucClientProvider = defaultMucClientProvider) {
+    fun start() {
         JibriStatusPacketExt.registerExtensionProvider()
         ProviderManager.addIQProvider(
             JibriIq.ELEMENT_NAME, JibriIq.NAMESPACE, JibriIqProvider()
         )
 
-        // Join all the MUCs we've been told to
-        for (config in xmppConfigs) {
-            for (host in config.xmppServerHosts) {
-                logger.info("Connecting to xmpp environment on $host with config $config")
-                val configBuilder = XMPPTCPConnectionConfiguration.builder()
-                    .setHost(host)
-                    .setXmppDomain(config.controlLogin.domain)
-                    .setUsernameAndPassword(config.controlLogin.username, config.controlLogin.password)
-                if (config.trustAllXmppCerts) {
-                    logger.info("The trustAllXmppCerts config is enabled for this domain, " +
-                            "all XMPP server provided certificates will be accepted")
-                    configBuilder.setCustomX509TrustManager(TrustAllX509TrustManager())
-                    configBuilder.setHostnameVerifier(TrustAllHostnameVerifier())
-                }
-                try {
-                    val mucClient =
-                        mucClientProvider(configBuilder.build(), "${config.name}: ${config.controlLogin.domain}@$host")
-                    mucClient.addIqRequestHandler(object : JibriSyncIqRequestHandler() {
-                        override fun handleJibriIqRequest(jibriIq: JibriIq): IQ {
-                            return handleJibriIq(jibriIq, config, mucClient)
-                        }
-                    })
-                    val recordingMucJid = JidCreate.bareFrom("${config.controlMuc.roomName}@${config.controlMuc.domain}")
-                    val sipMucJid: BareJid? = config.sipControlMuc?.let {
-                        JidCreate.entityBareFrom("${config.sipControlMuc.roomName}@${config.sipControlMuc.domain}")
-                    }
-                    val updatePresence: (JibriStatusPacketExt.Status) -> Unit = { status ->
-                        logger.info("Jibri reports its status is now $status, publishing presence to connection ${config.name}")
-                        // We need to update our presence in potentially 2 MUCs: the recording muc and the SIP
-                        // MUC
-                        mucClient.sendStanza(JibriPresenceHelper.createPresence(status, recordingMucJid))
-                        sipMucJid?.let {
-                            mucClient.sendStanza(JibriPresenceHelper.createPresence(status, it))
-                        }
-                    }
+        val mucClientManager = MucClientManager(emptyArray<String>())
 
-                    jibriManager.addStatusHandler(updatePresence)
-                    // The recording control muc
-                    mucClient.createOrJoinMuc(
-                        recordingMucJid.asEntityBareJidIfPossible(),
-                        Resourcepart.from(config.controlMuc.nickname),
-                        ::updatePresenceStanza
-                    )
-                    // The SIP control muc
-                    config.sipControlMuc?.let {
-                        logger.info("SIP control muc is defined for environment ${config.name}, joining")
-                        mucClient.createOrJoinMuc(
-                            JidCreate.entityBareFrom("${config.sipControlMuc.roomName}@${config.sipControlMuc.domain}"),
-                            Resourcepart.from(config.sipControlMuc.nickname),
-                            ::updatePresenceStanza
-                        )
-                    }
-                } catch (e: Exception) {
-                    logger.error("Error connecting to xmpp environment: $e")
+        mucClientManager.registerIQ(JibriIq())
+        mucClientManager.setIQListener(::handleIq)
+
+        val updatePresence: (JibriStatusPacketExt.Status) -> Unit = { status ->
+            logger.info("Jibri reports its status is now $status, publishing presence to all connections.");
+            val jibriStatus = JibriStatusPacketExt()
+            jibriStatus.status = status
+            mucClientManager.setPresenceExtension(jibriStatus)
+        }
+        jibriManager.addStatusHandler(updatePresence)
+
+        // Create a list of MucClient configs based on this.xmppConfigs
+        for (mucClientConfig in createMucClientConfigs()) {
+            mucClientManager.addMucClient(mucClientConfig)
+        }
+    }
+
+    private fun createMucClientConfigs(): List<MucClientConfiguration>
+    {
+        val mucClientConfigurations: MutableList<MucClientConfiguration> = mutableListOf()
+        for (xmppEnvironmentConfig in xmppConfigs) {
+            for (hostname in xmppEnvironmentConfig.xmppServerHosts) {
+                val id = xmppEnvironmentConfig.name + "-" + hostname
+                val mucClientConfig = MucClientConfiguration(id)
+
+                mucClientConfig.hostname = hostname
+                mucClientConfig.domain = xmppEnvironmentConfig.controlLogin.domain
+                mucClientConfig.username = xmppEnvironmentConfig.controlLogin.username
+                mucClientConfig.password = xmppEnvironmentConfig.controlLogin.password
+                if (xmppEnvironmentConfig.trustAllXmppCerts) {
+                    mucClientConfig.disableCertificateVerification = true
+                }
+
+                val mucJids: MutableList<String> = mutableListOf()
+                val recordingMucJid = "${xmppEnvironmentConfig.controlMuc.roomName}@${xmppEnvironmentConfig.controlMuc.domain}"
+                mucJids.add(recordingMucJid);
+                if (xmppEnvironmentConfig.sipControlMuc != null){
+                    mucJids.add("${xmppEnvironmentConfig.sipControlMuc.roomName}@${xmppEnvironmentConfig.sipControlMuc.domain}")
+                }
+                mucClientConfig.mucJids = mucJids
+
+                if (mucClientConfig.isComplete) {
+                    mucClientConfigurations.add(mucClientConfig)
+                } else {
+                    logger.error("Incomplete MucClientConfiguration")
                 }
             }
         }
+        return mucClientConfigurations
     }
 
     /**
@@ -152,19 +143,34 @@ class XmppApi(
         presence.addExtension(jibriStatus)
     }
 
-    /**
-     * Helper function to handle a [JibriIq] message with the context of the [XmppEnvironmentConfig] and [MucClient]
-     * that this [JibriIq] was received on.
-     */
-    private fun handleJibriIq(jibriIq: JibriIq, xmppEnvironment: XmppEnvironmentConfig, mucClient: MucClient): IQ {
-        logger.info("Received JibriIq ${jibriIq.toXML()} from environment ${xmppEnvironment.name}")
-        return when (jibriIq.action) {
-            JibriIq.Action.START -> handleStartJibriIq(jibriIq, xmppEnvironment, mucClient)
-            JibriIq.Action.STOP -> handleStopJibriIq(jibriIq)
-            else -> IQ.createErrorResponse(
-                jibriIq,
-                XMPPError.getBuilder().setCondition(XMPPError.Condition.bad_request))
+    private fun handleIq(iq: IQ, mucClient: MucClient): IQ {
+        logger.info("Received an IQ ${iq.toXML()}.");
+        return if (iq is JibriIq) {
+            when (iq.action) {
+                JibriIq.Action.START -> handleStartJibriIq(iq, findXmppEnvironment(mucClient), mucClient)
+                JibriIq.Action.STOP -> handleStopJibriIq(iq)
+                else -> IQ.createErrorResponse(
+                        iq,
+                        XMPPError.getBuilder().setCondition(XMPPError.Condition.bad_request))
+            }
+        } else {
+            IQ.createErrorResponse(
+                    iq,
+                    XMPPError.getBuilder().setCondition(XMPPError.Condition.bad_request))
         }
+    }
+
+    private fun findXmppEnvironment(mucClient: MucClient): XmppEnvironmentConfig? {
+        for (xmppEnvironmentConfig in xmppConfigs) {
+            for (hostname in xmppEnvironmentConfig.xmppServerHosts) {
+                val id = xmppEnvironmentConfig.name + "-" + hostname
+                if (id == mucClient.getId()) {
+                    return xmppEnvironmentConfig
+                }
+            }
+        }
+
+        return null
     }
 
     /**
